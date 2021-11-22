@@ -197,3 +197,8 @@ Temporary Items
 .apdisk
 
 # End of https://www.toptal.com/developers/gitignore/api/macos
+
+# Dataset
+data/visda17
+data/office
+data/officehome
