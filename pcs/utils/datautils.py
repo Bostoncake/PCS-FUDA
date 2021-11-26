@@ -87,7 +87,10 @@ class Imagelists(torch.utils.data.Dataset):
                 path = os.path.join(self.root, self.imgs[index])
                 img = self.loader(path)
                 if self.transform is not None:
-                    img = self.transform(img)
+                    if type(self.transform).__name__=='list':
+                        img = [t(img) for t in self.transform]
+                    else:
+                        img = self.transform(img)
                 images.append(img)
             self.images = images
 
@@ -105,7 +108,10 @@ class Imagelists(torch.utils.data.Dataset):
             path = os.path.join(self.root, self.imgs[index])
             img = self.loader(path)
             if self.transform is not None:
-                img = self.transform(img)
+                if type(self.transform).__name__=='list':
+                    img = [t(img) for t in self.transform]
+                else:
+                    img = self.transform(img)
 
         target = self.labels[index]
         if self.target_transform is not None:
@@ -193,7 +199,11 @@ def create_dataset(
 
     stat = f"{name}_{domain}" if use_mean_std else "imagenet"
     if image_transform is not None and isinstance(image_transform, str):
-        transform = get_augmentation(image_transform, stat=stat, image_size=image_size)
+        if image_transform == "mixmatch":
+            transform = get_augmentation("aug_0", stat=stat, image_size=image_size)
+            transform = [transform, transform]
+        else:
+            transform = get_augmentation(image_transform, stat=stat, image_size=image_size)
 
     return Imagelists(
         f"data/splits/{name}/{txt}.txt",
@@ -203,6 +213,54 @@ def create_dataset(
         transform=transform,
     )
 
+def create_mixmatch_dataset(
+    name,
+    domain,
+    new_domain,
+    txt="",
+    suffix="",
+    keep_in_mem=False,
+    ret_index=False,
+    image_transform=None,
+    use_mean_std=False,
+    image_size=224,
+    ind_list=None,
+    exp_path=None,
+):
+    if suffix != "":
+        suffix = "_" + suffix
+    if txt == "":
+        txt = f"{domain}{suffix}"
+
+    stat = f"{name}_{domain}" if use_mean_std else "imagenet"
+    if image_transform is not None and isinstance(image_transform, str):
+        if image_transform == "mixmatch":
+            transform = get_augmentation("aug_0", stat=stat, image_size=image_size)
+            transform = [transform, transform]
+        else:
+            transform = get_augmentation(image_transform, stat=stat, image_size=image_size)
+    new_list = []
+    if ind_list is not None:
+        image_list = f"data/splits/{name}/{txt}.txt"
+        i = 0
+        for x in open(image_list):
+            if i in ind_list:
+                new_list.append(x)
+            i = i + 1
+    new_list_txt = new_domain + ".txt"
+    new_list_txt = os.path.join(exp_path, new_list_txt)
+    with open(new_list_txt, "w") as f:
+        for s in new_list:
+            f.write(s)
+
+
+    return Imagelists(
+        new_list_txt,
+        datasets_path[name],
+        keep_in_mem=keep_in_mem,
+        ret_index=ret_index,
+        transform=transform,
+    )
 
 # dataloader
 

@@ -108,6 +108,7 @@ def process_config(config_json, override_dotmap=None):
     config.checkpoint_dir = os.path.join(exp_dir, "checkpoints/")
     config.out_dir = os.path.join(exp_dir, "out/")
     config.log_dir = os.path.join(exp_dir, "logs/")
+    config.exp_dir = exp_dir
 
     makedirs(
         [config.summary_dir, config.checkpoint_dir, config.out_dir, config.log_dir]

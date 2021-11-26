@@ -2,6 +2,7 @@
 
 import argparse
 import os
+from posixpath import dirname
 
 from pcs.agents import *
 from pcs.utils import check_pretrain_dir, load_json, process_config, set_default
@@ -189,6 +190,8 @@ def update_config(config, args):
 
 
 if __name__ == "__main__":
+    print(os.path.dirname(os.path.abspath(__file__)))
+
     parser = init_parser()
     args = parser.parse_args()
 

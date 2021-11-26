@@ -237,6 +237,75 @@ class CDSAgent(BaseAgent):
         self.logger.info(
             f"Dataset {name}, source {self.config.data_params.source}, target {self.config.data_params.target}"
         )
+    
+    def _mixmatch_datasets(self, new_src, new_tar):
+        name = self.config.data_params.name
+        num_workers = self.config.data_params.num_workers
+        fewshot = self.config.data_params.fewshot
+        domain = self.domain_map
+        image_size = self.config.data_params.image_size
+        aug_src = self.config.data_params.aug_src
+        aug_tgt = self.config.data_params.aug_tgt
+        raw = "raw"
+
+        self.num_class = datautils.get_class_num(
+            f'data/splits/{name}/{domain["source"]}.txt'
+        )
+        self.class_map = datautils.get_class_map(
+            f'data/splits/{name}/{domain["target"]}.txt'
+        )
+
+        batch_size_dict = {
+            "test": self.config.optim_params.batch_size,
+            "source": self.config.optim_params.batch_size_src,
+            "target": self.config.optim_params.batch_size_tgt,
+            "labeled": self.config.optim_params.batch_size_lbd,
+        }
+        self.batch_size_dict = batch_size_dict
+        # MixMatch datasets
+        domain_name = "target"
+        if domain_name == "target":
+            mixmatch_dataset_source = datautils.create_mixmatch_dataset(
+                name,
+                domain[domain_name],
+                new_domain="source",
+                suffix="",
+                ret_index=True,
+                image_transform=aug_tgt,
+                use_mean_std=False,
+                image_size=image_size,
+                ind_list=new_src,
+                exp_path=self.config.exp_dir,
+            )
+            mixmatch_dataset_target = datautils.create_mixmatch_dataset(
+                name,
+                domain[domain_name],
+                new_domain="target",
+                suffix="",
+                ret_index=True,
+                image_transform="mixmatch",
+                use_mean_std=False,
+                image_size=image_size,
+                ind_list=new_tar,
+                exp_path=self.config.exp_dir,
+            )
+            mixmatch_loader_source = datautils.create_loader(
+                mixmatch_dataset_source,
+                batch_size_dict[domain_name],
+                is_train=True,
+                num_workers=num_workers,
+            )
+            mixmatch_loader_target = datautils.create_loader(
+                mixmatch_dataset_target,
+                batch_size_dict[domain_name],
+                is_train=True,
+                num_workers=num_workers,
+            )
+            self.set_attr(domain_name, "mixmatch_dataset_source", mixmatch_dataset_source)
+            self.set_attr(domain_name, "mixmatch_loader_source", mixmatch_loader_source)
+            self.set_attr(domain_name, "mixmatch_dataset_target", mixmatch_dataset_target)
+            self.set_attr(domain_name, "mixmatch_loader_target", mixmatch_loader_target)
+        pass
 
     def _create_model(self):
         version_grp = self.config.model_params.version.split("-")
@@ -315,7 +384,74 @@ class CDSAgent(BaseAgent):
         if self.config.optim_params.decay:
             self.optim_iterdecayLR = torchutils.lr_scheduler_invLR(self.optim)
 
-    def train_one_epoch(self):
+    def train_one_epoch(self):   
+
+
+        # mixmatch pre-processing before every epoch, split target into labeled and unlabeled by entropy
+        self.model = self.model.eval()
+        if self.cls:
+            self.cls_head.eval()
+        
+        # Forward all target images for entropy
+        self.logger.info("Start MixMatch pre-processing")
+        target_loader = self.get_attr("target", "train_loader")
+        start_test = True
+        with torch.no_grad():
+            iter_test = iter(target_loader)
+            for i in range(len(target_loader)):
+                data = iter_test.next()
+                target_ind = data[0]
+                target_img = data[1]
+                target_lbl = data[2]
+                inputs = target_img.cuda()
+
+                outputs = self.model(inputs)
+                outputs = F.normalize(outputs, dim=1)
+                outputs = self.cls_head(outputs)
+
+                if start_test:
+                    all_output = outputs.float().cpu()
+                    all_label = target_lbl.float()
+                    all_ind = target_ind
+                    start_test = False
+                else:
+                    all_output = torch.cat((all_output, outputs.float().cpu()), 0)
+                    all_label = torch.cat((all_label, target_lbl.float()), 0)
+                    all_ind = torch.cat((all_ind, target_ind), 0)
+        top_pred, predict = torch.max(all_output, 1)
+        acc = torch.sum(torch.squeeze(predict).float() == all_label).item() / float(all_label.size()[0]) * 100
+        mean_ent = torchutils.mixmatch_entropy(nn.Softmax(dim=1)(all_output))
+
+        self.logger.info("MixMatch Accuracy = {:.2f}; Mean Ent = {:.4f}".format(acc, mean_ent.mean()))
+
+        est_p = (mean_ent<mean_ent.mean()).sum().item() / mean_ent.size(0)  # less ent num
+        PS = est_p
+        value = mean_ent
+
+        new_tar = []
+        new_src = []
+        new_src_lbl = []
+        cls_k = self.num_class
+        for c in range(cls_k):
+            c_idx = np.where(predict==c)
+            c_idx = c_idx[0]
+            c_value = value[c_idx]
+
+            _, idx_ = torch.sort(c_value)
+            c_num = len(idx_)
+            c_num_s = int(c_num * PS)
+            
+            for ei in range(0, c_num_s):
+                ee = c_idx[idx_[ei]]
+                new_src.append(ee)
+                new_src_lbl.append(c)
+            for ei in range(c_num_s, c_num):
+                ee = c_idx[idx_[ei]]
+                new_tar.append(ee)
+
+        self._mixmatch_datasets(new_src, new_tar)
+
+
         # train preparation
         self.model = self.model.train()
         if self.cls:
@@ -331,6 +467,8 @@ class CDSAgent(BaseAgent):
 
         source_loader = self.get_attr("source", "train_loader")
         target_loader = self.get_attr("target", "train_loader")
+        mixmatch_loader_source = self.get_attr("target", "mixmatch_loader_source")
+        mixmatch_loader_target = self.get_attr("target", "mixmatch_loader_target")
         if self.config.steps_epoch is None:
             num_batches = max(len(source_loader), len(target_loader)) + 1
             self.logger.info(f"source loader batches: {len(source_loader)}")
@@ -391,12 +529,20 @@ class CDSAgent(BaseAgent):
             if self.cls and not batch_i % len(self.train_lbd_loader_source):
                 source_lbd_iter = iter(self.train_lbd_loader_source)
 
+            # MixMatch iteration
+            if not batch_i % len(mixmatch_loader_source):
+                mixmatch_iter_source = iter(mixmatch_loader_source)
+            if not batch_i % len(mixmatch_loader_target):
+                mixmatch_iter_target = iter(mixmatch_loader_target)
+
             # calculate loss
             for domain_name in ("source", "target"):
                 loss = torch.tensor(0).cuda()
                 loss_d = 0
                 loss_part_d = [0] * num_loss
                 batch_size = self.batch_size_dict[domain_name]
+
+                # in-class data fields generated by iterating over loss configs (self.ssl, self.cls, etc.)
 
                 if self.cls and domain_name == "source":
                     indices_lbd, images_lbd, labels_lbd = next(source_lbd_iter)
@@ -405,33 +551,33 @@ class CDSAgent(BaseAgent):
                     labels_lbd = labels_lbd.cuda()
                     feat_lbd = self.model(images_lbd)
                     feat_lbd = F.normalize(feat_lbd, dim=1)
-                    out_lbd = self.cls_head(feat_lbd)
+                    out_lbd = self.cls_head(feat_lbd)   # model output for labeled source domain images
 
                 # Matching & ssl
                 if (self.tgt and domain_name == "target") or self.ssl:
                     loader_iter = (
                         source_iter if domain_name == "source" else target_iter
-                    )
+                    )   # iteraion over all images in domain
 
                     indices_unl, images_unl, _ = next(loader_iter)
                     images_unl = images_unl.cuda()
                     indices_unl = indices_unl.cuda()
                     feat_unl = self.model(images_unl)
                     feat_unl = F.normalize(feat_unl, dim=1)
-                    out_unl = self.cls_head(feat_unl)
+                    out_unl = self.cls_head(feat_unl)   # model output for unlabeled domain images
 
                 # Semi Supervised
                 if self.semi and domain_name == "source":
-                    semi_mask = ~torchutils.isin(indices_unl, fewshot_index)
+                    semi_mask = ~torchutils.isin(indices_unl, fewshot_index)    # converts to bool array
 
-                    indices_semi = indices_unl[semi_mask]
-                    out_semi = out_unl[semi_mask]
+                    indices_semi = indices_unl[semi_mask]   # filter the 'false' positions
+                    out_semi = out_unl[semi_mask]   # confidence output for all images (contains all classes, 31 for office dataset)
 
                 # Self-supervised Learning
                 if self.ssl:
                     _, new_data_memory, loss_ssl, aux_list = self.loss_fn(
                         indices_unl, feat_unl, domain_name, self.parallel_helper_idxs
-                    )
+                    )   # ssda.py defined loss
                     loss_ssl = [torch.mean(ls) for ls in loss_ssl]
 
                 # pseudo
@@ -444,7 +590,7 @@ class CDSAgent(BaseAgent):
 
                 if is_pseudo[domain_name]:
                     if domain_name == "source":
-                        indices_pseudo = indices_semi
+                        indices_pseudo = indices_semi   # only unlabeled
                         out_pseudo = out_semi
                         pseudo_domain = self.predict_ordered_labels_pseudo_source
                     else:
@@ -476,6 +622,89 @@ class CDSAgent(BaseAgent):
 
                     pseudo_domain[indices_selected] = pred_selected
                     pseudo_domain[indices_unselected] = -1
+                
+                # MixMatch
+                if domain_name == "target":
+                    mixmatch_source_ind, mixmatch_source_img, mixmatch_source_lbl = next(mixmatch_iter_source)
+                    mixmatch_target_ind, mixmatch_target_img, _ = next(mixmatch_iter_target)
+                    mixmatch_source_ind = mixmatch_source_ind.cuda()
+                    mixmatch_source_img = mixmatch_source_img.cuda()
+                    mixmatch_target_ind = mixmatch_target_ind.cuda()
+                    mixmatch_target_img1 = mixmatch_target_img[0].cuda()
+                    mixmatch_target_img2 = mixmatch_target_img[1].cuda()
+
+                    assert mixmatch_source_ind.shape[0] == self.batch_size_dict["target"]
+                    assert mixmatch_source_img.shape[0] == self.batch_size_dict["target"]
+                    assert mixmatch_source_lbl.shape[0] == self.batch_size_dict["target"]
+                    assert mixmatch_target_ind.shape[0] == self.batch_size_dict["target"]
+                    assert mixmatch_target_img1.shape[0] == self.batch_size_dict["target"]
+                    assert mixmatch_target_img2.shape[0] == self.batch_size_dict["target"]
+                    # mixmatch_target_img = mixmatch_img[~is_source_mask].cuda()
+                    targets_s = torch.zeros(self.batch_size_dict["target"], self.num_class).scatter_(1, mixmatch_source_lbl.view(-1,1), 1)   # Generate One-Hot vectors from label
+                    inputs_s = mixmatch_source_img
+                    targets_s = targets_s.cuda()
+                    inputs_t = mixmatch_target_img1
+                    inputs_t2 = mixmatch_target_img2
+
+                    T = 0.5
+                    alpha = 0.75
+                    lambda_u = 100
+
+                    with torch.no_grad():
+                        # compute guessed labels of unlabel samples
+                        outputs_u = self.model(inputs_t)
+                        outputs_u = F.normalize(outputs_u, dim=1)
+                        outputs_u = self.cls_head(outputs_u)
+                        outputs_u2 = self.model(inputs_t2)
+                        outputs_u2 = F.normalize(outputs_u2, dim=1)
+                        outputs_u2 = self.cls_head(outputs_u2)
+                        p = (outputs_u + outputs_u2) / 2
+                        pt = p**(1/T)
+                        targets_u = pt / pt.sum(dim=1, keepdim=True)
+                        targets_u = targets_u.detach()
+
+                    ####################################################################
+                    all_inputs = torch.cat([inputs_s, inputs_t, inputs_t2], dim=0)
+                    all_targets = torch.cat([targets_s, targets_u, targets_u], dim=0)
+                    if alpha > 0:
+                        l = np.random.beta(alpha, alpha)
+                        l = max(l, 1-l)
+                    else:
+                        l = 1
+                    idx_source = torch.randperm(all_inputs.size(0))
+                    idx_target = torch.randperm(all_targets.size(0))
+
+                    input_a, input_b = all_inputs, all_inputs[idx_source]
+                    target_a, target_b = all_targets, all_targets[idx_target]
+                    mixed_input = l * input_a + (1 - l) * input_b
+                    mixed_target = l * target_a + (1 - l) * target_b
+
+                    # interleave labeled and unlabed samples between batches to get correct batchnorm calculation 
+                    mixed_input = list(torch.split(mixed_input, self.batch_size_dict["target"]))
+                    mixed_input = torchutils.interleave(mixed_input, self.batch_size_dict["target"])  
+
+                    logits = self.model(mixed_input[0])
+                    logits = F.normalize(logits, dim=1)
+                    logits = self.cls_head(logits)
+                    logits = [logits]
+                    for input in mixed_input[1:]:
+                        temp = self.model(input)
+                        temp = F.normalize(temp, dim=1)
+                        temp = self.cls_head(temp)
+                        logits.append(temp)
+
+                    # put interleaved samples back
+                    logits = torchutils.interleave(logits, self.batch_size_dict["target"])
+                    logits_x = logits[0]
+                    logits_u = torch.cat(logits[1:], dim=0)
+
+                    train_criterion = torchutils.SemiLoss()
+
+                    Lx, Lu, w = train_criterion(logits_x, mixed_target[:self.batch_size_dict["target"]], logits_u, mixed_target[self.batch_size_dict["target"]:], 
+                        batch_i, num_batches, lambda_u)
+                    mixmatch_loss = Lx + w * Lu
+
+
 
                 # Compute Loss
 
@@ -498,7 +727,7 @@ class CDSAgent(BaseAgent):
                     elif ls == "semi-condentmax" and domain_name == "source":
                         bs = out_semi.size(0)
                         prob_semi = F.softmax(out_semi, dim=1)
-                        prob_mean_semi = prob_semi.sum(dim=0) / bs
+                        prob_mean_semi = prob_semi.sum(dim=0) / bs  # average by class
 
                         # update momentum
                         self.momentum_softmax_source.update(
@@ -511,7 +740,7 @@ class CDSAgent(BaseAgent):
                         # compute loss
                         entropy_cond = -torch.sum(
                             prob_mean_semi * torch.log(momentum_prob_source + 1e-5)
-                        )
+                        )   # entropy calc by multiplying tensors
                         loss_part = -entropy_cond
 
                     # learning on unlabeled target domain
@@ -543,6 +772,11 @@ class CDSAgent(BaseAgent):
                     loss = loss + loss_part
                     loss_d = loss_d + loss_part.item()
                     loss_part_d[ind] = loss_part.item()
+
+                # Add mixmatch loss
+                if domain_name == "target":
+                    loss = loss + self.config.optim_params.mixmatch_loss * mixmatch_loss
+                    loss_d = loss_d + self.config.optim_params.mixmatch_loss * mixmatch_loss.item()
 
                 # Backpropagation
                 self.optim.zero_grad()
